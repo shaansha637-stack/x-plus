@@ -282,32 +282,76 @@ static void XPDownloadAndSave(NSURL *url, BOOL isVideo) {
 }
 @end
 
-#pragma mark - Native tab customization screen (safe info version)
+#pragma mark - Native tab customization screen
 
-static void XPOpenTabCustomization(void) {
+// Finds X's current account object by asking view controllers for `account` / `currentAccount`.
+static id XPFindAccountInVC(UIViewController *vc, int depth, NSMutableSet *seen) {
+    if (!vc || depth > 10) return nil;
+    NSValue *k = [NSValue valueWithNonretainedObject:vc];
+    if ([seen containsObject:k]) return nil;
+    [seen addObject:k];
+    for (NSString *key in @[@"account", @"currentAccount"]) {
+        id a = XPSafeValue(vc, key);
+        if (a && [NSStringFromClass([a class]) containsString:@"Account"]) return a;
+    }
+    NSMutableArray *kids = [NSMutableArray arrayWithArray:vc.childViewControllers];
+    if (vc.presentedViewController) [kids addObject:vc.presentedViewController];
+    for (UIViewController *c in kids) {
+        id a = XPFindAccountInVC(c, depth + 1, seen);
+        if (a) return a;
+    }
+    return nil;
+}
+
+static id XPFindCurrentAccount(void) {
+    id a = XPFindAccountInVC(XPKeyWindow().rootViewController, 0, [NSMutableSet set]);
+    if (a) return a;
+    id delegate = UIApplication.sharedApplication.delegate;
+    for (NSString *key in @[@"currentAccount", @"account"]) {
+        a = XPSafeValue(delegate, key);
+        if (a && [NSStringFromClass([a class]) containsString:@"Account"]) return a;
+    }
+    return nil;
+}
+
+static id XPMakeScribeContext(void) {
+    Class cls = NSClassFromString(@"TFSTwitterScribeContext");
+    if (!cls) return nil;
+    @try {
+        SEL s = NSSelectorFromString(@"scribeContextWithPage:");
+        Method m = class_getClassMethod(cls, s);
+        if (m && method_getNumberOfArguments(m) == 3 && method_getTypeEncoding(m)[0] == '@') {
+            id (*send)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+            id c = send(cls, s, @"home");
+            if (c) return c;
+        }
+        return [[cls alloc] init];
+    } @catch (__unused NSException *e) {}
+    return nil;
+}
+
+static void XPOpenTabCustomization(UINavigationController *nav) {
     Class cls = NSClassFromString(@"T1TabCustomizationViewController");
     if (!cls) { XPAlert(@"Tab customization", @"T1TabCustomizationViewController was not found in this X version."); return; }
-    NSMutableArray *lines = [NSMutableArray array];
-    unsigned int n = 0;
-    Method *ms = class_copyMethodList(cls, &n);
-    for (unsigned int i = 0; i < n; i++) {
-        NSString *name = NSStringFromSelector(method_getName(ms[i]));
-        if ([name hasPrefix:@"init"]) [lines addObject:name];
+    SEL initSel = NSSelectorFromString(@"initWithAccount:scribeContext:");
+    if (![cls instancesRespondToSelector:initSel]) { XPAlert(@"Tab customization", @"initWithAccount:scribeContext: is not available in this X version."); return; }
+
+    id account = XPFindCurrentAccount();
+    if (!account) { XPAlert(@"Tab customization", @"Could not find the current account object. Close this screen, open the Home timeline, and try again."); return; }
+    id ctx = XPMakeScribeContext();
+
+    UIViewController *vc = nil;
+    @try {
+        id (*initWith)(id, SEL, id, id) = (id (*)(id, SEL, id, id))objc_msgSend;
+        vc = initWith([cls alloc], initSel, account, ctx);
+    } @catch (NSException *e) {
+        XPAlert(@"Tab customization failed", e.reason ?: @"Exception while creating the screen.");
+        return;
     }
-    free(ms);
-    n = 0;
-    Method *cms = class_copyMethodList(object_getClass(cls), &n);
-    for (unsigned int i = 0; i < n && i < 15; i++) {
-        [lines addObject:[@"+" stringByAppendingString:NSStringFromSelector(method_getName(cms[i]))]];
-    }
-    free(cms);
-    n = 0;
-    objc_property_t *ps = class_copyPropertyList(cls, &n);
-    for (unsigned int i = 0; i < n && i < 15; i++) {
-        [lines addObject:[@"prop " stringByAppendingString:@(property_getName(ps[i]))]];
-    }
-    free(ps);
-    XPAlert(@"Tab customization screen", [lines componentsJoinedByString:@"\n"]);
+    if (![vc isKindOfClass:[UIViewController class]]) { XPAlert(@"Tab customization", @"The screen could not be created."); return; }
+
+    if (nav) [nav pushViewController:vc animated:YES];
+    else [XPTopViewController() presentViewController:[[UINavigationController alloc] initWithRootViewController:vc] animated:YES completion:nil];
 }
 
 #pragma mark - Settings screen (modern design)
@@ -497,9 +541,9 @@ static UIImage *XPIconForKey(NSString *key) {
 
     if (ip.row >= (NSInteger)keys.count) {
         cell.imageView.image = XPIconForKey(@"_action");
-        cell.textLabel.text = @"Tab Customization Info";
+        cell.textLabel.text = @"Open Tab Customization";
         cell.textLabel.textColor = XP_ACCENT;
-        cell.detailTextLabel.text = @"Experimental: shows details of X's native navigation editor.";
+        cell.detailTextLabel.text = @"Opens X's native navigation bar editor.";
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         cell.tintColor = XP_MUTED;
         return cell;
@@ -523,7 +567,7 @@ static UIImage *XPIconForKey(NSString *key) {
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
     NSDictionary *sec = XPLayout()[ip.section];
-    if (ip.row >= (NSInteger)[sec[@"keys"] count]) XPOpenTabCustomization();
+    if (ip.row >= (NSInteger)[sec[@"keys"] count]) XPOpenTabCustomization(self.navigationController);
 }
 
 - (void)toggled:(UISwitch *)sw {
