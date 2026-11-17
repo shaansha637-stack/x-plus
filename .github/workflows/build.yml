@@ -7,11 +7,24 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      THEOS: ${{ github.workspace }}/theos
     steps:
       - uses: actions/checkout@v4
 
-      - name: Runner test
+      - name: Install Theos (Linux)
+        uses: Randomblock1/theos-action@v1
+
+      - name: Build dylib
+        run: make clean all FINALPACKAGE=1
+
+      - name: Collect dylib
         run: |
-          echo "Runner is working"
-          uname -a
-          ls -la
+          mkdir -p out
+          cp "$(find .theos/obj -name XPlus.dylib | head -1)" out/XPlus.dylib
+          file out/XPlus.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XPlus-dylib
+          path: out/XPlus.dylib
