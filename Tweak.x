@@ -7,6 +7,8 @@
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
+#import <Photos/Photos.h>
 
 #pragma mark - Preferences
 
@@ -26,6 +28,12 @@ static NSArray<NSDictionary *> *XPItems(void) {
           @"sub": @"Hides the 'new posts' pill.", @"def": @NO},
         @{@"key": @"keepTabBar",    @"title": @"Keep Tab Bar Visible",
           @"sub": @"Tab bar does not collapse when scrolling.", @"def": @NO},
+        @{@"key": @"skipLaunch",    @"title": @"Skip Launch Animation",
+          @"sub": @"Speeds up the animated splash screen when X opens.", @"def": @YES},
+        @{@"key": @"downloads",     @"title": @"Media Downloads",
+          @"sub": @"Long-press a photo/video in a post to save it to Photos.", @"def": @YES},
+        @{@"key": @"navCustom",     @"title": @"Native Tab Customization",
+          @"sub": @"Unlocks X's own navigation bar customization screen.", @"def": @YES},
         @{@"key": @"inspector",     @"title": @"Inspector Mode (developer)",
           @"sub": @"Long-press with TWO fingers on any element to see its class names. Used to add new features.", @"def": @NO},
     ];
@@ -59,6 +67,244 @@ static UIViewController *XPTopViewController(void) {
     return vc;
 }
 
+
+#pragma mark - Generic helpers (alerts, safe runtime access)
+
+static void XPAlert(NSString *title, NSString *message) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *top = XPTopViewController();
+        if (!top) return;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:title message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [a addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+        [top presentViewController:a animated:YES completion:nil];
+    });
+}
+
+static void XPToast(NSString *message) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *top = XPTopViewController();
+        if (!top) return;
+        UIAlertController *a = [UIAlertController alertControllerWithTitle:nil message:message
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+        [top presentViewController:a animated:YES completion:^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ [a dismissViewControllerAnimated:YES completion:nil]; });
+        }];
+    });
+}
+
+// Calls a no-argument getter only if it exists and returns an object (or a scalar number).
+static id XPSafeValue(id obj, NSString *name) {
+    if (!obj || !name) return nil;
+    SEL sel = NSSelectorFromString(name);
+    if (![obj respondsToSelector:sel]) return nil;
+    Method m = class_getInstanceMethod(object_getClass(obj), sel);
+    if (!m || method_getNumberOfArguments(m) != 2) return nil;
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc) return nil;
+    @try {
+        if (enc[0] == '@') {
+            id (*send)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+            return send(obj, sel);
+        }
+        if (enc[0] && strchr("cCsSiIlLqQ", enc[0])) return [obj valueForKey:name];
+    } @catch (__unused NSException *e) {}
+    return nil;
+}
+
+static NSURL *XPURLFrom(id v) {
+    if ([v isKindOfClass:[NSURL class]]) return v;
+    if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) return [NSURL URLWithString:v];
+    return nil;
+}
+
+#pragma mark - Media finder (walks X's own objects looking for media entities)
+
+static BOOL XPAllowedClass(Class c) {
+    NSString *n = NSStringFromClass(c);
+    for (NSString *p in @[@"T1", @"TFN", @"TFS", @"THF", @"TTA", @"TUI", @"TweetMedia", @"_TtC"]) {
+        if ([n hasPrefix:p]) return YES;
+    }
+    return NO;
+}
+
+static NSArray *XPFindMediaEntities(id root, NSMutableOrderedSet *seenClasses) {
+    NSMutableArray *found = [NSMutableArray array];
+    NSMutableArray *queue = [NSMutableArray arrayWithObject:@[root, @0]];
+    NSMutableSet *visited = [NSMutableSet set];
+    NSArray *probe = @[@"status", @"statusViewModel", @"viewModel", @"mediaEntities", @"allMediaEntities",
+                       @"inlineMediaInfos", @"media", @"mediaEntity", @"attachment", @"entities"];
+    NSUInteger steps = 0;
+    while (queue.count && steps++ < 500) {
+        NSArray *item = queue.firstObject; [queue removeObjectAtIndex:0];
+        id o = item[0]; int depth = [item[1] intValue];
+        if (!o) continue;
+        NSValue *key = [NSValue valueWithNonretainedObject:o];
+        if ([visited containsObject:key]) continue;
+        [visited addObject:key];
+
+        if ([o isKindOfClass:[NSArray class]] || [o isKindOfClass:[NSSet class]] || [o isKindOfClass:[NSOrderedSet class]]) {
+            if (depth > 6) continue;
+            for (id e in o) [queue addObject:@[e, @(depth + 1)]];
+            continue;
+        }
+        Class cls = object_getClass(o);
+        NSString *cn = NSStringFromClass(cls);
+        if (!XPAllowedClass(cls)) continue;
+        [seenClasses addObject:cn];
+        if ([cn isEqualToString:@"TFSTwitterEntityMedia"]) { [found addObject:o]; continue; }
+        if (depth >= 6) continue;
+
+        for (NSString *name in probe) {
+            id v = XPSafeValue(o, name);
+            if (v && ![v isKindOfClass:[NSNumber class]]) [queue addObject:@[v, @(depth + 1)]];
+        }
+        for (Class c = cls; c && XPAllowedClass(c); c = class_getSuperclass(c)) {
+            unsigned int n = 0;
+            Ivar *ivars = class_copyIvarList(c, &n);
+            for (unsigned int i = 0; i < n; i++) {
+                const char *enc = ivar_getTypeEncoding(ivars[i]);
+                if (!enc || enc[0] != '@') continue;
+                id v = object_getIvar(o, ivars[i]);
+                if (v) [queue addObject:@[v, @(depth + 1)]];
+            }
+            free(ivars);
+        }
+    }
+    return found;
+}
+
+// Turns media entities into downloadable options: {title, url, video}
+static NSArray<NSDictionary *> *XPMediaOptions(NSArray *entities) {
+    NSMutableArray *opts = [NSMutableArray array];
+    int photoIndex = 0;
+    for (id e in entities) {
+        id videoInfo = XPSafeValue(e, @"videoInfo");
+        NSArray *variants = videoInfo ? XPSafeValue(videoInfo, @"variants") : nil;
+        if ([variants isKindOfClass:[NSArray class]] && variants.count) {
+            NSURL *best = nil; double bestRate = -1;
+            for (id v in variants) {
+                NSURL *u = XPURLFrom(XPSafeValue(v, @"url")) ?: XPURLFrom(XPSafeValue(v, @"URL"));
+                if (!u) continue;
+                NSString *ct = [XPSafeValue(v, @"contentType") description] ?: @"";
+                BOOL isMP4 = [u.absoluteString containsString:@".mp4"] || [ct containsString:@"mp4"];
+                if (!isMP4) continue;
+                double rate = [[XPSafeValue(v, @"bitrate") description] doubleValue];
+                if (rate > bestRate) { bestRate = rate; best = u; }
+            }
+            if (best) [opts addObject:@{@"title": @"Save Video", @"url": best, @"video": @YES}];
+            continue;
+        }
+        for (NSString *k in @[@"mediaURL", @"mediaUrl", @"mediaURLHTTPS", @"imageURL", @"originalImageURL", @"url"]) {
+            NSURL *u = XPURLFrom(XPSafeValue(e, k));
+            if (!u) continue;
+            NSString *s = u.absoluteString;
+            if (![s containsString:@"twimg.com"] && ![s hasSuffix:@".jpg"] && ![s hasSuffix:@".png"]) continue;
+            if ([s containsString:@"pbs.twimg.com/media"] && !u.query) {
+                u = [NSURL URLWithString:[s stringByAppendingString:@"?name=orig"]] ?: u;
+            }
+            photoIndex++;
+            [opts addObject:@{@"title": [NSString stringWithFormat:@"Save Photo %d", photoIndex], @"url": u, @"video": @NO}];
+            break;
+        }
+    }
+    return opts;
+}
+
+static void XPDownloadAndSave(NSURL *url, BOOL isVideo) {
+    XPToast(@"Downloading...");
+    NSURLSessionDownloadTask *task = [[NSURLSession sharedSession] downloadTaskWithURL:url
+        completionHandler:^(NSURL *loc, NSURLResponse *resp, NSError *err) {
+            if (err || !loc) { XPAlert(@"Download failed", err.localizedDescription ?: @"No file received."); return; }
+            NSString *ext = isVideo ? @"mp4" : (url.pathExtension.length ? url.pathExtension : @"jpg");
+            NSURL *dst = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:
+                          [NSString stringWithFormat:@"xplus_%@.%@", NSUUID.UUID.UUIDString, ext]]];
+            [[NSFileManager defaultManager] moveItemAtURL:loc toURL:dst error:nil];
+            [PHPhotoLibrary requestAuthorizationForAccessLevel:PHAccessLevelAddOnly handler:^(PHAuthorizationStatus st) {
+                if (st != PHAuthorizationStatusAuthorized && st != PHAuthorizationStatusLimited) {
+                    XPAlert(@"Photos access denied", @"Allow adding photos for X in iOS Settings.");
+                    return;
+                }
+                [[PHPhotoLibrary sharedPhotoLibrary] performChanges:^{
+                    if (isVideo) [PHAssetCreationRequest creationRequestForAssetFromVideoAtFileURL:dst];
+                    else         [PHAssetCreationRequest creationRequestForAssetFromImageAtFileURL:dst];
+                } completionHandler:^(BOOL ok, NSError *e) {
+                    [[NSFileManager defaultManager] removeItemAtURL:dst error:nil];
+                    if (ok) XPToast(isVideo ? @"Video saved" : @"Photo saved");
+                    else XPAlert(@"Save failed", e.localizedDescription ?: @"Unknown error");
+                }];
+            }];
+        }];
+    [task resume];
+}
+
+@interface XPMediaLongPress : NSObject
++ (instancetype)shared;
+- (void)handle:(UILongPressGestureRecognizer *)g;
+@end
+
+@implementation XPMediaLongPress
++ (instancetype)shared {
+    static XPMediaLongPress *i; static dispatch_once_t once;
+    dispatch_once(&once, ^{ i = [XPMediaLongPress new]; });
+    return i;
+}
+- (void)handle:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan || !XPGet(@"downloads", YES)) return;
+    UIView *root = g.view;
+    UIView *v = g.view;
+    for (int i = 0; i < 10 && v; i++, v = v.superview) {
+        NSString *n = NSStringFromClass([v class]);
+        if ([n isEqualToString:@"T1StandardStatusView"] || [n isEqualToString:@"T1StatusCell"]) { root = v; break; }
+    }
+    NSMutableOrderedSet *seen = [NSMutableOrderedSet orderedSet];
+    NSArray *entities = XPFindMediaEntities(root, seen);
+    NSArray<NSDictionary *> *opts = XPMediaOptions(entities);
+    if (!opts.count) {
+        NSArray *names = [seen.array subarrayWithRange:NSMakeRange(0, MIN((NSUInteger)30, seen.count))];
+        XPAlert(@"No downloadable media found",
+                [NSString stringWithFormat:@"Entities: %lu\nIf this keeps happening, send a screenshot of this message.\n\nClasses seen:\n%@",
+                 (unsigned long)entities.count, [names componentsJoinedByString:@"\n"]]);
+        return;
+    }
+    [[UIImpactFeedbackGenerator new] impactOccurred];
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"XPlus Download" message:nil
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSDictionary *o in opts) {
+        [sheet addAction:[UIAlertAction actionWithTitle:o[@"title"] style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *a) { XPDownloadAndSave(o[@"url"], [o[@"video"] boolValue]); }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    sheet.popoverPresentationController.sourceView = g.view;
+    sheet.popoverPresentationController.sourceRect = g.view.bounds;
+    [XPTopViewController() presentViewController:sheet animated:YES completion:nil];
+}
+@end
+
+#pragma mark - Native tab customization screen
+
+static void XPOpenTabCustomization(void) {
+    Class cls = NSClassFromString(@"T1TabCustomizationViewController");
+    UIViewController *top = XPTopViewController();
+    if (!cls || !top) { XPAlert(@"Tab customization", @"T1TabCustomizationViewController was not found in this X version."); return; }
+    UIViewController *vc = nil;
+    @try { vc = [[cls alloc] init]; } @catch (__unused NSException *e) {}
+    if (![vc isKindOfClass:[UIViewController class]]) {
+        NSMutableArray *inits = [NSMutableArray array];
+        unsigned int n = 0; Method *ms = class_copyMethodList(cls, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            NSString *s = NSStringFromSelector(method_getName(ms[i]));
+            if ([s hasPrefix:@"init"]) [inits addObject:s];
+        }
+        free(ms);
+        XPAlert(@"Could not create the screen", [NSString stringWithFormat:@"Init methods:\n%@", [inits componentsJoinedByString:@"\n"]]);
+        return;
+    }
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    [top presentViewController:nav animated:YES completion:nil];
+}
+
 #pragma mark - Settings screen
 
 @interface XPSettingsViewController : UITableViewController
@@ -80,15 +326,32 @@ static UIViewController *XPTopViewController(void) {
 
 - (void)close { [self dismissViewControllerAnimated:YES completion:nil]; }
 
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { return 2; }
+
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    return XPItems().count;
+    return s == 0 ? (NSInteger)XPItems().count : 1;
+}
+
+- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
+    [tv deselectRowAtIndexPath:ip animated:YES];
+    if (ip.section == 1) {
+        [self dismissViewControllerAnimated:YES completion:^{ XPOpenTabCustomization(); }];
+    }
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForFooterInSection:(NSInteger)s {
+    if (s == 1) return nil;
     return @"Changes apply immediately. Some options need an app restart to fully take effect. Long-press the Home tab to open this screen.";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
+    if (ip.section == 1) {
+        UITableViewCell *c = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
+        c.textLabel.text = @"Open Native Tab Customization";
+        c.detailTextLabel.text = @"Experimental: opens X's own navigation bar editor.";
+        c.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return c;
+    }
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:nil];
     NSDictionary *item = XPItems()[ip.row];
     cell.textLabel.text = item[@"title"];
@@ -284,6 +547,38 @@ static BOOL XPIsHomeTab(UIView *v) {
     g.cancelsTouchesInView = NO;
     [self addGestureRecognizer:g];
     objc_setAssociatedObject(self, kXPLongPressKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+%end
+
+@interface T1AnimatedLaunchScreenView : UIView @end
+%hook T1AnimatedLaunchScreenView
+- (void)animateRevealWithCompletion:(void *)completion {
+    if (XPGet(@"skipLaunch", YES)) self.layer.speed = 100.0f;
+    %orig(completion);
+}
+%end
+
+@interface T1TabCustomizationConfig : NSObject @end
+%hook T1TabCustomizationConfig
+- (BOOL)isTabCustomizationEnabled {
+    return XPGet(@"navCustom", YES) ? YES : %orig;
+}
+%end
+
+static const void *kXPMediaKey = &kXPMediaKey;
+
+@interface T1StatusPhotoVideoForwardView : UIView @end
+%hook T1StatusPhotoVideoForwardView
+- (void)didMoveToWindow {
+    %orig;
+    if (!self.window) return;
+    if (objc_getAssociatedObject(self, kXPMediaKey)) return;
+    UILongPressGestureRecognizer *g =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:[XPMediaLongPress shared] action:@selector(handle:)];
+    g.minimumPressDuration = 0.6;
+    g.cancelsTouchesInView = NO;
+    [self addGestureRecognizer:g];
+    objc_setAssociatedObject(self, kXPMediaKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 %end
 
