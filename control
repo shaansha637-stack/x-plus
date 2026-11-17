@@ -1,0 +1,9 @@
+Package: com.myname.xplus
+Name: XPlus
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: Personal customization tweak for X
+Maintainer: me
+Author: me
+Section: Tweaks
+Depends: mobilesubstrate

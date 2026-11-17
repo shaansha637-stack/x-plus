@@ -1,0 +1,38 @@
+name: Build XPlus dylib
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          brew install ldid make
+          echo "$(brew --prefix make)/libexec/gnubin" >> $GITHUB_PATH
+
+      - name: Install Theos and SDKs
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git $HOME/theos
+          git clone --depth=1 https://github.com/theos/sdks.git /tmp/sdks
+          mkdir -p $HOME/theos/sdks
+          cp -R /tmp/sdks/*.sdk $HOME/theos/sdks/
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+
+      - name: Build dylib
+        run: make clean all FINALPACKAGE=1
+
+      - name: Collect dylib
+        run: |
+          mkdir -p out
+          cp "$(find .theos/obj -name XPlus.dylib | head -1)" out/XPlus.dylib
+          file out/XPlus.dylib
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XPlus-dylib
+          path: out/XPlus.dylib
