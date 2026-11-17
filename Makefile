@@ -7,6 +7,6 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = XPlus
 XPlus_FILES = Tweak.x
 XPlus_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
-XPlus_FRAMEWORKS = UIKit Foundation
+XPlus_FRAMEWORKS = UIKit Foundation Photos
 
 include $(THEOS_MAKE_PATH)/tweak.mk
